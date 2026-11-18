@@ -4,6 +4,7 @@ const ffmpegPath = require('ffmpeg-static');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { execFile } = require('child_process');
 const ytdl = require('@distube/ytdl-core');
 
 ffmpeg.setFfmpegPath(ffmpegPath);
@@ -20,9 +21,8 @@ const YT_KEYS = [YT_KEY, YT_KEY2].filter(Boolean);
 let activeYtKeyIndex = 0;
 
 const YM = 'https://www.call2all.co.il/ym/api/';
-const ADMIN_LOG_EXT = '8';
-
-const YOUTUBE_MAIN_EXT = '/1/0000000144';
+const ADMIN_LOG_EXT = (process.env.ADMIN_LOG_EXT || '8').trim();
+const ENV_MAIN_EXT = (process.env.MAIN_EXT || '').trim();
 const RESULTS_PER_PAGE = 7;
 
 let cachedModelName = null;
@@ -30,6 +30,202 @@ const folderCounters = {};
 const userNamesCache = new Map();
 const configuredPlayfileDirs = new Set();
 const userSessionState = new Map();
+
+// === מנגנון yt-dlp + PO Token אוטומטי ללא קוקיז ===
+const YTDLP_BIN_PATH = path.join(os.tmpdir(), 'yt-dlp-linux');
+let ytdlpReadyPromise = null;
+let cachedPoTokenData = null;
+let lastPoTokenTime = 0;
+
+function normalizeMainExt(extVal) {
+    const clean = String(extVal || '')
+        .replace(/^ivr2:\/*/, '')
+        .replace(/^\/+/, '')
+        .replace(/\/+$/, '')
+        .trim();
+    return clean ? `/${clean}` : '/9';
+}
+
+function findDownloadedFileByPrefix(prefix) {
+    try {
+        const files = fs.readdirSync(os.tmpdir());
+        const match = files.find(f =>
+            f.startsWith(prefix + '.') &&
+            !f.endsWith('.part') &&
+            !f.endsWith('.ytdl') &&
+            !f.endsWith('.temp')
+        );
+        if (match) {
+            const fullPath = path.join(os.tmpdir(), match);
+            const stat = fs.statSync(fullPath);
+            if (stat.size > 20000) {
+                return { filePath: fullPath, size: stat.size };
+            }
+        }
+    } catch (e) {}
+    return null;
+}
+
+function cleanupFilesByPrefix(prefix) {
+    try {
+        const files = fs.readdirSync(os.tmpdir());
+        for (const f of files) {
+            if (f.startsWith(prefix)) {
+                fs.promises.unlink(path.join(os.tmpdir(), f)).catch(() => null);
+            }
+        }
+    } catch (e) {}
+}
+
+async function ensureYtDlpBinary() {
+    if (ytdlpReadyPromise) return ytdlpReadyPromise;
+
+    ytdlpReadyPromise = (async () => {
+        try {
+            if (fs.existsSync(YTDLP_BIN_PATH) && fs.statSync(YTDLP_BIN_PATH).size > 1000000) {
+                await fs.promises.chmod(YTDLP_BIN_PATH, 0o755);
+                return YTDLP_BIN_PATH;
+            }
+            console.log('[yt-dlp] Downloading standalone yt-dlp_linux binary...');
+            const binUrl = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux';
+            const res = await fetchWithTimeout(binUrl, {}, 45000);
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const buf = Buffer.from(await res.arrayBuffer());
+            await fs.promises.writeFile(YTDLP_BIN_PATH, buf);
+            await fs.promises.chmod(YTDLP_BIN_PATH, 0o755);
+            console.log(`[yt-dlp] Binary ready at ${YTDLP_BIN_PATH} (${buf.length} bytes)`);
+            return YTDLP_BIN_PATH;
+        } catch (err) {
+            console.warn('[yt-dlp] Binary setup error:', err.message);
+            ytdlpReadyPromise = null;
+            throw err;
+        }
+    })();
+
+    return ytdlpReadyPromise;
+}
+
+async function getFreshPoToken() {
+    if (cachedPoTokenData && (Date.now() - lastPoTokenTime < 3600000)) {
+        return cachedPoTokenData;
+    }
+    try {
+        const { generate } = require('youtube-po-token-generator');
+        const tokenData = await generate();
+        if (tokenData && tokenData.poToken && tokenData.visitorData) {
+            cachedPoTokenData = tokenData;
+            lastPoTokenTime = Date.now();
+            console.log('[PO Token] Generated fresh PO Token & VisitorData successfully');
+            return tokenData;
+        }
+    } catch (err) {
+        console.warn('[PO Token] Generator warning:', err.message);
+    }
+    return null;
+}
+
+async function downloadWithYtDlpNoCookies(videoId, maxDurationSec = 900, perAttemptTimeoutMs = 15000) {
+    const binPath = await ensureYtDlpBinary();
+    const poData = await getFreshPoToken();
+
+    const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
+    const clientStrategies = [];
+
+    if (poData && poData.poToken && poData.visitorData) {
+        clientStrategies.push(
+            `youtube:player_client=mweb,web;po_token=mweb.gvs+${poData.poToken},web.gvs+${poData.poToken};visitor_data=${poData.visitorData}`
+        );
+    }
+    clientStrategies.push(
+        'youtube:player_client=android_vr,ios,tv_embedded',
+        'youtube:player_client=tv,mweb'
+    );
+
+    const uniquePrefix = `ytdlp_${videoId}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const outputTemplate = path.join(os.tmpdir(), `${uniquePrefix}.%(ext)s`);
+
+    let lastErr = '';
+    for (const extractorArg of clientStrategies) {
+        cleanupFilesByPrefix(uniquePrefix);
+        try {
+            const args = [
+                '--no-playlist',
+                '--no-check-certificates',
+                '--no-cache-dir',
+                '--force-ipv4',
+                '--extractor-args', extractorArg,
+                '-f', 'bestaudio[ext=m4a][abr<=128]/bestaudio[abr<=96]/bestaudio/worst',
+                '--ffmpeg-location', ffmpegPath
+            ];
+
+            if (maxDurationSec > 0 && maxDurationSec <= 950) {
+                args.push('--download-sections', `*0-${maxDurationSec}`);
+            }
+
+            args.push('-o', outputTemplate, videoUrl);
+
+            await new Promise((resolve, reject) => {
+                execFile(binPath, args, { timeout: perAttemptTimeoutMs, maxBuffer: 8 * 1024 * 1024 }, (error, stdout, stderr) => {
+                    const found = findDownloadedFileByPrefix(uniquePrefix);
+                    if (found) {
+                        return resolve();
+                    }
+                    reject(new Error((stderr || (error && error.message) || 'yt-dlp failed').slice(-300)));
+                });
+            });
+
+            const found = findDownloadedFileByPrefix(uniquePrefix);
+            if (found) {
+                console.log(`[yt-dlp Success] Downloaded ${found.size} bytes using ${extractorArg.slice(0, 48)}`);
+                return {
+                    filePath: found.filePath,
+                    size: found.size,
+                    cleanup: () => cleanupFilesByPrefix(uniquePrefix)
+                };
+            }
+        } catch (err) {
+            lastErr = err.message;
+            console.warn(`[yt-dlp Attempt Failed] (${extractorArg.slice(0, 35)}):`, lastErr.slice(0, 180));
+            cleanupFilesByPrefix(uniquePrefix);
+        }
+    }
+
+    throw new Error('YTDLP_ALL_STRATEGIES_FAILED: ' + lastErr);
+}
+
+async function downloadWithYtdlFallback(videoId, targetFilePath, maxBytes, timeoutMs = 12000) {
+    return new Promise((resolve, reject) => {
+        let dl = 0;
+        const ws = fs.createWriteStream(targetFilePath);
+        const st = ytdl(`https://www.youtube.com/watch?v=${videoId}`, {
+            filter: 'audioonly',
+            quality: 'lowestaudio',
+            playerClients: ['IOS', 'ANDROID', 'TV']
+        });
+        const tm = setTimeout(() => {
+            try { st.destroy(); } catch (e) {}
+            ws.end(() => dl >= 30000 ? resolve(dl) : reject(new Error('ytdl fallback timeout')));
+        }, timeoutMs);
+
+        st.on('data', c => {
+            dl += c.length;
+            ws.write(c);
+            if (dl >= maxBytes) {
+                clearTimeout(tm);
+                try { st.destroy(); } catch (e) {}
+                ws.end(() => resolve(dl));
+            }
+        });
+        st.on('end', () => {
+            clearTimeout(tm);
+            ws.end(() => dl >= 30000 ? resolve(dl) : reject(new Error('ytdl fallback empty stream')));
+        });
+        st.on('error', e => {
+            clearTimeout(tm);
+            ws.end(() => dl >= 250000 ? resolve(dl) : reject(e));
+        });
+    });
+}
 
 function lastVal(param) {
     if (Array.isArray(param)) {
@@ -193,9 +389,11 @@ async function getUserNameIfRegistered(phone) {
     return null;
 }
 
-async function ensurePlayfileExtension(folderPathStr) {
+async function ensurePlayfileExtension(folderPathStr, returnExt) {
     const clean = String(folderPathStr).replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
-    if (configuredPlayfileDirs.has(clean)) return;
+    const targetReturn = normalizeMainExt(returnExt);
+    const cacheKey = `${clean}|${targetReturn}`;
+    if (configuredPlayfileDirs.has(cacheKey)) return;
 
     try {
         const body = new URLSearchParams({
@@ -211,15 +409,15 @@ async function ensurePlayfileExtension(folderPathStr) {
 
         const playfileIni = [
             'type=playfile',
-            `playfile_end_goto=${YOUTUBE_MAIN_EXT}`,
-            `empty_goto=${YOUTUBE_MAIN_EXT}`,
-            `root_goto=${YOUTUBE_MAIN_EXT}`,
-            `control_play_return=${YOUTUBE_MAIN_EXT}`,
-            `control_play#=${YOUTUBE_MAIN_EXT}`
+            `playfile_end_goto=${targetReturn}`,
+            `empty_goto=${targetReturn}`,
+            `root_goto=${targetReturn}`,
+            `control_play_return=${targetReturn}`,
+            `control_play#=${targetReturn}`
         ].join('\r\n') + '\r\n';
         await uploadTextToExactPath(playfileIni, `ivr2:/${clean}/ext.ini`, 'ext.ini');
 
-        configuredPlayfileDirs.add(clean);
+        configuredPlayfileDirs.add(cacheKey);
     } catch (e) {
         console.warn(`[Ensure Playfile ${clean}]`, e.message);
     }
@@ -294,7 +492,7 @@ async function saveAdminLogToExt8(callerPhone, userName, categoryLabel, searchQu
     try {
         const nextNum = await getNextFileNumberStr(ADMIN_LOG_EXT, 1);
         const nowStr = new Date().toLocaleString('he-IL', { timeZone: 'Asia/Jerusalem' });
-        
+
         const ttsSummary = `משתמש ${userName} טלפון ${callerPhone} חיפש ב${categoryLabel} את ${searchQuery}. סטטוס: ${statusText}`;
         await uploadTextToExactPath(ttsSummary, `ivr2:/${ADMIN_LOG_EXT}/${nextNum}.tts`, `${nextNum}.tts`);
 
@@ -318,7 +516,7 @@ async function saveAdminLogToExt8(callerPhone, userName, categoryLabel, searchQu
 async function downloadRecordingFromYemot(recordPath, apiDir) {
     const cleanPath = String(recordPath).replace(/^ivr2:\/*/, '').replace(/^\/*/, '');
     const cleanDir = String(apiDir || '').replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
-    
+
     const candidates = [
         `ivr2:/${cleanPath}`,
         `ivr2:${cleanPath}`
@@ -343,7 +541,7 @@ async function downloadRecordingFromYemot(recordPath, apiDir) {
             }
             const buf = Buffer.from(await res.arrayBuffer());
             const headStr = buf.toString('utf8', 0, Math.min(buf.length, 150));
-            
+
             if (buf.length > 200 && !headStr.includes('responseStatus') && !headStr.includes('EXCEPTION')) {
                 console.log(`[Yemot Download] Success from ${p} (${buf.length} bytes)`);
                 return buf;
@@ -470,198 +668,39 @@ async function convertSegmentToWavFast(inputPath, outputWavPath, startSec = 0, d
     });
 }
 
-// === גרסה 34.0: שליפת קישורי שמע מ-Piped API + Invidious מעודכנים במקביל כדי לעקוף חסימת IP של יוטיוב ===
-async function getFastStreamUrls(videoId) {
-    const pipedApis = [
-        'https://pipedapi.kavin.rocks',
-        'https://pipedapi.tokhmi.xyz',
-        'https://pipedapi.syncpundit.io',
-        'https://pipedapi.adminforge.de',
-        'https://api.piped.private.coffee',
-        'https://pipedapi.drgns.space'
-    ];
-
-    const invidiousHosts = [
-        'https://inv.nadeko.net',
-        'https://invidious.nerdvpn.de',
-        'https://invidious.jing.rocks',
-        'https://invidious.privacyredirect.com',
-        'https://yewtu.be',
-        'https://inv.tux.pizza'
-    ];
-
-    const urls = [];
-
-    // 1. בדיקה מהירה מול שרתי Piped API במקביל
-    const pipedTask = Promise.any(pipedApis.map(async (apiHost) => {
-        const res = await fetchWithTimeout(`${apiHost}/streams/${videoId}`, {
-            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
-        }, 3500);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
-        const audioStreams = (data.audioStreams || []).filter(s => s && s.url);
-        if (audioStreams.length === 0) throw new Error('No Piped audio');
-        audioStreams.sort((a, b) => (parseInt(a.bitrate) || 999999) - (parseInt(b.bitrate) || 999999));
-        return audioStreams.slice(0, 3).map(s => s.url);
-    })).catch(() => []);
-
-    // 2. בדיקה מהירה מול שרתי Invidious API במקביל
-    const invidiousTask = Promise.any(invidiousHosts.map(async (host) => {
-        const apiRes = await fetchWithTimeout(`${host}/api/v1/videos/${videoId}`, {
-            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
-        }, 3500);
-        if (!apiRes.ok) throw new Error(`HTTP ${apiRes.status}`);
-        const data = await apiRes.json();
-        const formats = (data.adaptiveFormats || []).filter(f => (f.type || '').startsWith('audio/'));
-        if (formats.length === 0) throw new Error('No Invidious audio');
-        formats.sort((a, b) => (parseInt(a.bitrate) || 999999) - (parseInt(b.bitrate) || 999999));
-        const extracted = [];
-        for (const fmt of formats.slice(0, 2)) {
-            if (fmt.url) extracted.push(fmt.url);
-            extracted.push(`${host}/latest_version?id=${videoId}&itag=${fmt.itag || 140}&local=true`);
-        }
-        return extracted;
-    })).catch(() => []);
-
-    const [pipedUrls, invUrls] = await Promise.all([pipedTask, invidiousTask]);
-    urls.push(...pipedUrls, ...invUrls);
-
-    // 3. קישורי פרוקסי ישירים לגיבוי
-    for (const host of invidiousHosts.slice(0, 4)) {
-        urls.push(`${host}/latest_version?id=${videoId}&itag=140&local=true`);
-        urls.push(`${host}/latest_version?id=${videoId}&itag=139&local=true`);
-        urls.push(`${host}/latest_version?id=${videoId}&itag=249&local=true`);
-    }
-
-    return [...new Set(urls)];
-}
-
-// הורדה באמצעות ytdl עם לקוחות מובייל (IOS/ANDROID) שעוקפים חסימת בוט בשרתי ענן
-async function downloadWithYtdlMobileClient(videoId, targetFilePath, maxBytes, timeoutMs = 15000) {
-    return new Promise((resolve, reject) => {
-        let dl = 0;
-        const ws = fs.createWriteStream(targetFilePath);
-        const ytdlOpts = {
-            filter: 'audioonly',
-            quality: 'lowestaudio',
-            playerClients: ['IOS', 'ANDROID', 'WEB_EMBEDDED', 'TV']
-        };
-        const st = ytdl(`https://www.youtube.com/watch?v=${videoId}`, ytdlOpts);
-        const tm = setTimeout(() => {
-            try { st.destroy(); } catch (e) {}
-            ws.end(() => dl >= 30000 ? resolve(dl) : reject(new Error('ytdl timeout')));
-        }, timeoutMs);
-
-        st.on('data', c => {
-            dl += c.length;
-            ws.write(c);
-            if (dl >= maxBytes) {
-                clearTimeout(tm);
-                try { st.destroy(); } catch (e) {}
-                ws.end(() => resolve(dl));
-            }
-        });
-        st.on('end', () => {
-            clearTimeout(tm);
-            ws.end(() => dl >= 30000 ? resolve(dl) : reject(new Error('ytdl empty stream')));
-        });
-        st.on('error', e => {
-            clearTimeout(tm);
-            ws.end(() => dl >= 250000 ? resolve(dl) : reject(e));
-        });
-    });
-}
-
-async function downloadStreamFastToLocalFile(streamUrl, targetFilePath, maxBytes, timeoutMs = 15000) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    let downloaded = 0;
-
-    try {
-        const res = await fetch(streamUrl, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Range': `bytes=0-${maxBytes}`
-            },
-            signal: controller.signal
-        });
-
-        if (!res.ok && res.status !== 206) {
-            throw new Error(`HTTP ${res.status}`);
-        }
-
-        const cType = (res.headers.get('content-type') || '').toLowerCase();
-        if (cType.includes('text/html') || cType.includes('application/json')) {
-            throw new Error(`Invalid content-type: ${cType}`);
-        }
-
-        const fileStream = fs.createWriteStream(targetFilePath);
-        for await (const chunk of res.body) {
-            downloaded += chunk.length;
-            fileStream.write(chunk);
-            if (downloaded >= maxBytes) {
-                try { controller.abort(); } catch (e) {}
-                break;
-            }
-        }
-
-        await new Promise(r => fileStream.end(r));
-        clearTimeout(timer);
-
-        if (downloaded < 30000) {
-            throw new Error(`Downloaded too small (${downloaded} bytes)`);
-        }
-        return downloaded;
-    } catch (e) {
-        clearTimeout(timer);
-        if (downloaded >= 250000 && fs.existsSync(targetFilePath)) {
-            return downloaded;
-        }
-        throw e;
-    }
-}
-
-async function downloadAndPreparePlayback(videoId, livePlayFolder, archiveUserFolder, durationSeconds = 0) {
+async function downloadAndPreparePlayback(videoId, livePlayFolder, archiveUserFolder, durationSeconds = 0, returnExt = '/9') {
     const cleanLive = String(livePlayFolder).replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
     const cleanArchive = String(archiveUserFolder).replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
 
-    const streamUrls = await getFastStreamUrls(videoId);
-    let workingUrl = null;
-    let initialDownloadedBytes = 0;
-    const QUICK_LIMIT_BYTES = 5.5 * 1024 * 1024;
-
-    const tmpQuickInput = path.join(os.tmpdir(), `quick_in_${videoId}_${Date.now()}.audio`);
     const tmpQuickWav = path.join(os.tmpdir(), `quick_out_${videoId}_${Date.now()}.wav`);
+    const tmpFallbackIn = path.join(os.tmpdir(), `quick_fb_${videoId}_${Date.now()}.webm`);
+    let quickCleanup = () => fs.promises.unlink(tmpFallbackIn).catch(() => null);
 
     try {
-        for (const sUrl of streamUrls.slice(0, 8)) {
-            try {
-                initialDownloadedBytes = await downloadStreamFastToLocalFile(sUrl, tmpQuickInput, QUICK_LIMIT_BYTES, 9000);
-                await convertSegmentToWavFast(tmpQuickInput, tmpQuickWav, 0, 900);
-                if (fs.existsSync(tmpQuickWav) && fs.statSync(tmpQuickWav).size > 20000) {
-                    workingUrl = sUrl;
-                    console.log(`[Part 1 Fast Start] Success from proxy stream`);
-                    break;
-                }
-            } catch (err) {
-                console.warn(`[Part 1 Fast Start] URL attempt failed: ${err.message}`);
-            }
+        const isLongVideo = durationSeconds > 900;
+        const firstChunkDuration = isLongVideo ? 905 : 0;
+        let quickInputPath = null;
+
+        try {
+            const dlRes = await downloadWithYtDlpNoCookies(videoId, firstChunkDuration, 14000);
+            quickInputPath = dlRes.filePath;
+            quickCleanup = dlRes.cleanup;
+        } catch (ytdlpErr) {
+            console.warn('[Part 1] yt-dlp failed, trying ytdl fallback:', ytdlpErr.message.slice(0, 160));
+            await downloadWithYtdlFallback(videoId, tmpFallbackIn, 5.5 * 1024 * 1024, 10000);
+            quickInputPath = tmpFallbackIn;
         }
 
-        if (!workingUrl) {
-            initialDownloadedBytes = await downloadWithYtdlMobileClient(videoId, tmpQuickInput, QUICK_LIMIT_BYTES, 12000);
-            await convertSegmentToWavFast(tmpQuickInput, tmpQuickWav, 0, 900);
-        }
+        await convertSegmentToWavFast(quickInputPath, tmpQuickWav, 0, 900);
 
         let quickWavBuf = await fs.promises.readFile(tmpQuickWav);
-        fs.promises.unlink(tmpQuickInput).catch(() => null);
+        quickCleanup();
         fs.promises.unlink(tmpQuickWav).catch(() => null);
 
-        const hitDownloadCeiling = initialDownloadedBytes >= (QUICK_LIMIT_BYTES - 350000);
         const isFullFifteenMin = quickWavBuf.length >= 13800000;
         const isLongStream = (durationSeconds > 900)
             ? true
-            : (durationSeconds > 0 ? false : (hitDownloadCeiling || isFullFifteenMin));
+            : (durationSeconds > 0 ? false : isFullFifteenMin);
 
         if (!isLongStream) {
             const singleNum = await getNextFileNumberStr(cleanLive, 1);
@@ -670,7 +709,7 @@ async function downloadAndPreparePlayback(videoId, livePlayFolder, archiveUserFo
 
             (async () => {
                 try {
-                    await ensurePlayfileExtension(cleanArchive);
+                    await ensurePlayfileExtension(cleanArchive, returnExt);
                     const archNum = await getNextFileNumberStr(cleanArchive, 1);
                     const archTargetPath = `ivr2:/${cleanArchive}/${archNum}.wav`;
                     await uploadWavBufferToExactPath(quickWavBuf, archTargetPath, `${archNum}.wav`, 30000);
@@ -696,25 +735,19 @@ async function downloadAndPreparePlayback(videoId, livePlayFolder, archiveUserFo
         await uploadWavBufferToExactPath(quickWavBuf, partPaths[0], `${partNums[0]}.wav`, 20000);
 
         (async () => {
-            const tmpFullIn = path.join(os.tmpdir(), `full_in_${videoId}_${Date.now()}.audio`);
+            const tmpFullFb = path.join(os.tmpdir(), `full_fb_${videoId}_${Date.now()}.webm`);
+            let fullCleanup = () => fs.promises.unlink(tmpFullFb).catch(() => null);
             const validSegments = [];
 
             try {
-                const MAX_FULL_BYTES = 48 * 1024 * 1024;
-                let fullBytes = 0;
-                let downloadedFullOk = false;
-
-                if (workingUrl) {
-                    try {
-                        fullBytes = await downloadStreamFastToLocalFile(workingUrl, tmpFullIn, MAX_FULL_BYTES, 90000);
-                        downloadedFullOk = true;
-                    } catch (e) {
-                        downloadedFullOk = false;
-                    }
-                }
-
-                if (!downloadedFullOk) {
-                    fullBytes = await downloadWithYtdlMobileClient(videoId, tmpFullIn, MAX_FULL_BYTES, 90000);
+                let fullInputPath = null;
+                try {
+                    const fullRes = await downloadWithYtDlpNoCookies(videoId, 0, 65000);
+                    fullInputPath = fullRes.filePath;
+                    fullCleanup = fullRes.cleanup;
+                } catch (fullYtdlpErr) {
+                    await downloadWithYtdlFallback(videoId, tmpFullFb, 48 * 1024 * 1024, 90000);
+                    fullInputPath = tmpFullFb;
                 }
 
                 const segments = [];
@@ -725,7 +758,7 @@ async function downloadAndPreparePlayback(videoId, livePlayFolder, archiveUserFo
                 for (const seg of segments) {
                     const tmpPartWav = path.join(os.tmpdir(), `live_${seg.index}_${videoId}_${Date.now()}.wav`);
                     try {
-                        await convertSegmentToWavFast(tmpFullIn, tmpPartWav, seg.start, seg.duration);
+                        await convertSegmentToWavFast(fullInputPath, tmpPartWav, seg.start, seg.duration);
                         if (fs.existsSync(tmpPartWav)) {
                             const stat = fs.statSync(tmpPartWav);
                             if (stat.size > 1000) {
@@ -746,7 +779,7 @@ async function downloadAndPreparePlayback(videoId, livePlayFolder, archiveUserFo
                     fs.promises.unlink(tmpPartWav).catch(() => null);
                 }
 
-                await ensurePlayfileExtension(cleanArchive);
+                await ensurePlayfileExtension(cleanArchive, returnExt);
 
                 if (validSegments.length > 0) {
                     const rawArchNums = await getNextFileNumberStr(cleanArchive, validSegments.length);
@@ -760,7 +793,7 @@ async function downloadAndPreparePlayback(videoId, livePlayFolder, archiveUserFo
                         const tmpArchWav = path.join(os.tmpdir(), `arch_${seg.index}_${videoId}_${Date.now()}.wav`);
 
                         try {
-                            await convertSegmentToWavFast(tmpFullIn, tmpArchWav, seg.start, seg.duration);
+                            await convertSegmentToWavFast(fullInputPath, tmpArchWav, seg.start, seg.duration);
                             if (fs.existsSync(tmpArchWav)) {
                                 const archBuf = await fs.promises.readFile(tmpArchWav);
                                 await uploadWavBufferToExactPath(archBuf, archTargetPath, `${archNum}.wav`, 45000);
@@ -780,21 +813,21 @@ async function downloadAndPreparePlayback(videoId, livePlayFolder, archiveUserFo
                 console.warn('[Background Full Video] Warning:', bgErr.message);
                 if (validSegments.length === 0 && quickWavBuf) {
                     try {
-                        await ensurePlayfileExtension(cleanArchive);
+                        await ensurePlayfileExtension(cleanArchive, returnExt);
                         const archNum = await getNextFileNumberStr(cleanArchive, 1);
                         await uploadWavBufferToExactPath(quickWavBuf, `ivr2:/${cleanArchive}/${archNum}.wav`, `${archNum}.wav`, 35000);
                     } catch (e) {}
                 }
             } finally {
                 quickWavBuf = null;
-                fs.promises.unlink(tmpFullIn).catch(() => null);
+                fullCleanup();
             }
         })();
 
         return chainedPlayCommand;
 
     } catch (e) {
-        fs.promises.unlink(tmpQuickInput).catch(() => null);
+        quickCleanup();
         fs.promises.unlink(tmpQuickWav).catch(() => null);
         throw e;
     }
@@ -802,7 +835,7 @@ async function downloadAndPreparePlayback(videoId, livePlayFolder, archiveUserFo
 
 const MAIN_MENU_TEXT = 'ברוכים הבאים לחיפוש ביוטיוב! לשמיעת הפלייליסט שלכם הקישו 1 לשמיעת שיעורי התורה שלכם הקישו 2 לחיפוש מוזיקה חדש הקישו 3 לחיפוש שיעור חדש הקישו 4! שימו לב אם הסרטון ארוך מ 15 דקות הוא עולה בחלקים לשלוחת הפלייליסט או לשלוחת השיעורי תורה ! לחזרה לשלוחה הקודמת הקישו כוכבית! הקו מנוטר משתמש שיחפש תוכן לא ראוי יחסם ';
 
-app.get('/', (req, res) => { res.send('YouTube Personal Line Server v34.0 (Piped + Invidious + Mobile Client Fix) OK'); });
+app.get('/', (req, res) => { res.send('YouTube Personal Line Server v36.0 (Port Binding & Background Init Fix) OK'); });
 
 app.all(['/yemot', '/yemot/:e'], async (req, res) => {
     const q = { ...req.query, ...req.body };
@@ -813,6 +846,7 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
     try {
         const callerPhone = lastVal(q.ApiPhone).replace(/[^0-9]/g, '');
         const callId = lastVal(q.ApiCallId);
+        const currentMainExt = normalizeMainExt(q.main_ext || ENV_MAIN_EXT || lastVal(q.ApiExtension) || '/9');
 
         if (q.hangup === 'yes') {
             if (callerPhone) userSessionState.delete(callerPhone);
@@ -820,7 +854,7 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
         }
 
         if (!callerPhone) {
-            return res.send(`id_list_message=t-שגיאה בזיהוי מספר הטלפון&go_to_folder=${YOUTUBE_MAIN_EXT}`);
+            return res.send(`id_list_message=t-שגיאה בזיהוי מספר הטלפון&go_to_folder=${currentMainExt}`);
         }
 
         const hasMenuChoiceParam = (q.MenuChoice !== undefined);
@@ -902,12 +936,12 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
             const registeredName = (await getUserNameIfRegistered(callerPhone)) || 'משתמש רשום';
 
             try {
-                const playCmd = await downloadAndPreparePlayback(chosenVideo.videoId, tempRecFolder, archiveFolder, chosenVideo.durationSeconds || 0);
+                const playCmd = await downloadAndPreparePlayback(chosenVideo.videoId, tempRecFolder, archiveFolder, chosenVideo.durationSeconds || 0, currentMainExt);
                 saveAdminLogToExt8(callerPhone, registeredName, categoryLabel, cleanQuery, chosenVideo.title, `הורד בהצלחה (דף ${currentPage + 1} תוצאה ${digitNum}) לשלוחה ${archiveFolder}`);
                 userSessionState.set(callerPhone, { step: 'WAIT_MENU', callId });
 
                 const durationPart = chosenVideo.durationText ? ` באורך ${chosenVideo.durationText}` : '';
-                return res.send(`id_list_message=t-משמיע ${chosenVideo.title}${durationPart}.${playCmd}&go_to_folder=${YOUTUBE_MAIN_EXT}`);
+                return res.send(`id_list_message=t-משמיע ${chosenVideo.title}${durationPart}.${playCmd}&go_to_folder=${currentMainExt}`);
             } catch (audioErr) {
                 console.error('[Download Error]', audioErr.message);
                 userSessionState.set(callerPhone, { step: 'WAIT_MENU', callId });
@@ -1019,12 +1053,12 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
                 return res.send('go_to_folder=..');
             }
             if (menuChoice === '1') {
-                await ensurePlayfileExtension(musicExtFolder);
+                await ensurePlayfileExtension(musicExtFolder, currentMainExt);
                 userSessionState.set(callerPhone, { step: 'IN_PLAYLIST', callId });
                 return res.send(`go_to_folder=/${musicExtFolder}`);
             }
             if (menuChoice === '2') {
-                await ensurePlayfileExtension(torahExtFolder);
+                await ensurePlayfileExtension(torahExtFolder, currentMainExt);
                 userSessionState.set(callerPhone, { step: 'IN_PLAYLIST', callId });
                 return res.send(`go_to_folder=/${torahExtFolder}`);
             }
@@ -1060,8 +1094,8 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
             await uploadTextToExactPath(cleanName, `ivr2:/${userFolder}/name.txt`, 'name.txt');
             userNamesCache.set(callerPhone, cleanName);
 
-            await ensurePlayfileExtension(musicExtFolder);
-            await ensurePlayfileExtension(torahExtFolder);
+            await ensurePlayfileExtension(musicExtFolder, currentMainExt);
+            await ensurePlayfileExtension(torahExtFolder, currentMainExt);
 
             saveAdminLogToExt8(callerPhone, cleanName, 'רישום למערכת', 'הקלטת שם משתמש', '', 'נרשם בהצלחה');
 
@@ -1073,7 +1107,7 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
         return res.send(`read=t-${MAIN_MENU_TEXT}=MenuChoice,no,1,0,7,Digits,no`);
 
     } catch (e) {
-        console.error('[General Error v34.0]', e.message);
+        console.error('[General Error v36.0]', e.message);
         if (!res.headersSent) {
             return res.send(`read=t-${MAIN_MENU_TEXT}=MenuChoice,no,1,0,7,Digits,no`);
         }
@@ -1081,4 +1115,12 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
 });
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`=== Server v34.0 Ready on port ${port} ===`));
+app.listen(port, '0.0.0.0', () => {
+    console.log(`=== Server v36.0 Ready on port ${port} ===`);
+    setTimeout(async () => {
+        try {
+            await ensureYtDlpBinary();
+            await getFreshPoToken();
+        } catch (e) {}
+    }, 1500);
+});
